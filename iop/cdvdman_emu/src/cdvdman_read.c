@@ -37,14 +37,17 @@ static unsigned int cdvdman_read_sectors_end_cb(void *arg)
 }
 
 //-------------------------------------------------------------------------
-// Returns current IOP system time in microseconds.
-// IOP clock runs at 36.864 MHz; dividing ticks by 36 gives a close us approximation.
+// Returns current IOP system time as a tick-derived counter.
+// Uses only the low 32-bit word to avoid 64-bit division (__udivdi3),
+// which is unavailable in the IOP nostdlib environment.
+// >>5 approximates /32 (~1.15us per unit at 36.864MHz), good enough
+// for ms-level idle/seek tracking. Wraps every ~116s; delta comparisons
+// remain valid across the wrap for any interval under ~58s.
 static u64 cdvd_get_time_us(void)
 {
     iop_sys_clock_t clk;
     GetSystemTime(&clk);
-    u64 ticks = (u64)clk.hi << 32 | clk.lo;
-    return ticks / 36;
+    return (u64)(clk.lo >> 5);
 }
 
 //-------------------------------------------------------------------------
@@ -206,7 +209,8 @@ static u32 accurate_read_clocks(u32 lsn, unsigned int sectors)
         clocks_delay += extra_ticks;
 
         // Track projected completion time for idle detection in the read thread.
-        cdvd_last_read_end_us = now_us + (clocks_delay / 36);
+        // >>5 matches cdvd_get_time_us() units; avoids 64-bit division (__udivdi3).
+        cdvd_last_read_end_us = now_us + (u64)(clocks_delay >> 5);
 
         M_DEBUG("[CDVD] lba_dist=%u seek=%uus rot=%uus spin=%uus extra_ticks=%u\n",
                 lba_distance, seek_us, rot_us, spinup_us, extra_ticks);
