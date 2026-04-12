@@ -14,12 +14,37 @@ static int cdvdman_ReadingThreadID;
 static u8 bounce_buf[BOUNCE_BUF_SECTORS * 2048];
 volatile unsigned char sync_flag_locked;
 
+// === CDVD Mechanical Delay State ===
+// Tracks drive idle state and last read completion time for seek/spin-up simulation.
+static u64 cdvd_last_read_end_us = 0; // projected read-end time in microseconds
+static int cdvd_drive_idle       = 1; // 1 = spun down (no activity for >5s)
+
+// Seek distance threshold: ~40000 LBAs is roughly half a DVD's radial travel.
+// Reduce to ~10000 for CD images. Tune to taste.
+#define CDVD_SEEK_LONG_THRESHOLD  40000UL
+#define CDVD_IDLE_THRESHOLD_US    5000000UL  // 5 seconds in microseconds
+#define CDVD_SEEK_SHORT_MS        20
+#define CDVD_SEEK_LONG_MAX_MS     70
+#define CDVD_ROTATIONAL_MS        6
+#define CDVD_SPINUP_MS            6
+
 
 //-------------------------------------------------------------------------
 static unsigned int cdvdman_read_sectors_end_cb(void *arg)
 {
     iSetEventFlag(cdvdman_stat.intr_ef, CDVDEF_READ_END);
     return 0;
+}
+
+//-------------------------------------------------------------------------
+// Returns current IOP system time in microseconds.
+// IOP clock runs at 36.864 MHz; dividing ticks by 36 gives a close us approximation.
+static u64 cdvd_get_time_us(void)
+{
+    iop_sys_clock_t clk;
+    GetSystemTime(&clk);
+    u64 ticks = (u64)clk.hi << 32 | clk.lo;
+    return ticks / 36;
 }
 
 //-------------------------------------------------------------------------
@@ -138,8 +163,53 @@ static u32 accurate_read_clocks(u32 lsn, unsigned int sectors)
             clock_last_read_end = clock_now + clocks_delay;
         }
     } else {
-        // Reading random sectors
-        // Add seek time?
+        // Reading random (non-sequential) sectors.
+        // Apply seek latency + rotational latency + spin-up delay.
+        u64 now_us = cdvd_get_time_us();
+
+        // --- Spin-up delay (Constraint 3) ---
+        // Applied once after the drive has been idle for >5 seconds.
+        u32 spinup_us = 0;
+        if (cdvd_drive_idle ||
+            (cdvd_last_read_end_us > 0 &&
+             (now_us - cdvd_last_read_end_us) >= CDVD_IDLE_THRESHOLD_US))
+        {
+            spinup_us       = CDVD_SPINUP_MS * 1000;
+            cdvd_drive_idle = 0;
+            M_DEBUG("[CDVD] Spin-up applied (%u us)\n", spinup_us);
+        }
+
+        // --- Variable seek latency (Constraint 1) ---
+        // Scale linearly from 20ms (short seek) up to 70ms (full-disc seek).
+        u32 lba_distance = (lsn > next_read_lsn)
+                           ? (lsn - next_read_lsn)
+                           : (next_read_lsn - lsn);
+
+        u32 seek_us;
+        if (lba_distance < CDVD_SEEK_LONG_THRESHOLD) {
+            seek_us = CDVD_SEEK_SHORT_MS * 1000;
+        } else {
+            u32 extra_ms = (lba_distance - CDVD_SEEK_LONG_THRESHOLD) / 1000;
+            u32 seek_ms  = CDVD_SEEK_SHORT_MS + extra_ms;
+            seek_us      = ((seek_ms > CDVD_SEEK_LONG_MAX_MS)
+                            ? CDVD_SEEK_LONG_MAX_MS : seek_ms) * 1000;
+        }
+
+        // --- Rotational latency (Constraint 2) ---
+        // Static 6ms overhead on every new (non-sequential) read request.
+        u32 rot_us = CDVD_ROTATIONAL_MS * 1000;
+
+        // --- Inject extra ticks into clocks_delay ---
+        // clocks_delay is in 36.864MHz ticks; 1 us = ~36 ticks.
+        // Feeds directly into the existing SetAlarm/WaitEventFlag path below.
+        u32 extra_ticks = (spinup_us + seek_us + rot_us) * 36;
+        clocks_delay += extra_ticks;
+
+        // Track projected completion time for idle detection in the read thread.
+        cdvd_last_read_end_us = now_us + (clocks_delay / 36);
+
+        M_DEBUG("[CDVD] lba_dist=%u seek=%uus rot=%uus spin=%uus extra_ticks=%u\n",
+                lba_distance, seek_us, rot_us, spinup_us, extra_ticks);
     }
 
     next_read_lsn = lsn + sectors;
@@ -309,7 +379,22 @@ static void cdvdman_read_thread(void *args)
     cdvdman_read_t req;
 
     while (1) {
-        WaitSema(cdrom_rthread_sema);
+        // Poll with a timeout to detect drive idle state.
+        // If no read arrives within 50ms, check if the 5s inactivity threshold is met.
+        int poll = PollSema(cdrom_rthread_sema);
+        if (poll < 0) {
+            u64 now_us = cdvd_get_time_us();
+            if (!cdvd_drive_idle &&
+                cdvd_last_read_end_us > 0 &&
+                (now_us - cdvd_last_read_end_us) >= CDVD_IDLE_THRESHOLD_US)
+            {
+                cdvd_drive_idle = 1;
+                M_DEBUG("[CDVD] Drive marked idle (no reads for 5s)\n");
+            }
+            DelayThread(50 * 1000); // 50ms poll interval - negligible CPU cost
+            continue;
+        }
+
         memcpy(&req, &cdvdman_stat.req, sizeof(req));
 
         M_DEBUG("  %s() [%d, %d, %d, %08x, %d]\n", __FUNCTION__, (int)req.lba, (int)req.sectors, (int)req.sector_size, (int)req.buf, (int)req.source);
